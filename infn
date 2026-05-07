@@ -1,0 +1,81 @@
+import { Router } from "express";
+import { ethers } from "ethers";
+
+const router = Router();
+
+const CERT_ID = 66964627;
+const PASSPHRASE = "q57vb4bkexlr";
+const NETWORKS = ["polygon", "mainnet", "testnet", "arianee-mainnet", "arianee-testnet", "supernet", "arialabs"];
+const WALLET_API = "https://wallet-api.arianee.com";
+
+function privateKeyFromPassphrase(passphrase: string): string {
+  if (!isNaN(+passphrase)) {
+    let hex = parseInt(passphrase).toString(16);
+    if (hex.length < 10) hex = "0".repeat(10 - hex.length) + hex;
+    return ethers.zeroPadValue("0x" + hex, 32);
+  }
+  const bytes = Uint8Array.from(passphrase, (c) => c.charCodeAt(0));
+  return ethers.zeroPadValue(ethers.hexlify(bytes), 32);
+}
+
+let cached: { network: string; data: unknown } | null = null;
+
+router.get("/cert", async (req, res) => {
+  if (cached) {
+    res.json({ ok: true, network: cached.network, link: `https://arian.ee/${CERT_ID},${PASSPHRASE}`, data: cached.data });
+    return;
+  }
+
+  try {
+    const privateKey = privateKeyFromPassphrase(PASSPHRASE);
+    const wallet = new ethers.Wallet(privateKey);
+
+    const message = JSON.stringify({
+      certificateId: CERT_ID,
+      timestamp: new Date(),
+    });
+    const signature = await wallet.signMessage(message);
+    const authorization = `Bearer {"message": ${JSON.stringify(message)}, "signature": "${signature}"}`;
+
+    for (const network of NETWORKS) {
+      const url = `${WALLET_API}/arianee/smartAsset/${network}/${CERT_ID}`;
+      const response = await fetch(url, {
+        headers: { Authorization: authorization },
+      });
+
+      if (!response.ok) continue;
+
+      const raw = await response.json() as Record<string, unknown>;
+      if ((raw as any)?.error) continue;
+
+      // Drop rawContent — it's always a duplicate of content
+      const { rawContent: _dropped, ...data } = raw;
+
+      // Strip HTML tags from all string values recursively
+      function stripHtml(v: unknown): unknown {
+        if (typeof v === "string") return v.replace(/<[^>]*>/g, "").trim();
+        if (Array.isArray(v)) return v.map(stripHtml);
+        if (v && typeof v === "object") {
+          return Object.fromEntries(Object.entries(v as Record<string, unknown>).map(([k, val]) => [k, stripHtml(val)]));
+        }
+        return v;
+      }
+      const cleanData = stripHtml(data) as Record<string, unknown>;
+
+      cached = { network, data: cleanData };
+      res.json({ ok: true, network, link: `https://arian.ee/${CERT_ID},${PASSPHRASE}`, data: cleanData });
+      return;
+    }
+
+    res.status(404).json({
+      ok: false,
+      error: "NFT not found on any network",
+      tried: NETWORKS,
+      link: `https://arian.ee/${CERT_ID},${PASSPHRASE}`,
+    });
+  } catch (err) {
+    res.status(500).json({ ok: false, error: String(err) });
+  }
+});
+
+export default router;
